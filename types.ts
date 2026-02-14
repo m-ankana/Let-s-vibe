@@ -19,6 +19,19 @@ export interface Scenario {
   location: string;
 }
 
+export interface Correction {
+  original: string;
+  corrected: string;
+  explanation: string;
+  isCorrect: boolean;
+}
+
+export interface PronunciationFeedback {
+  score: number;
+  feedback: string;
+  issues: string[];
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'model';
@@ -26,6 +39,8 @@ export interface Message {
   timestamp: number;
   audioData?: string;
   isStreaming?: boolean;
+  correction?: Correction;
+  pronunciation?: PronunciationFeedback;
 }
 
 export type AppView = 'login' | 'select-language' | 'loading-scenario' | 'chat';

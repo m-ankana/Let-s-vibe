@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
-import { Message, Scenario, User, Language } from '../types';
-import { Send, User as UserIcon, Bot, ArrowLeft, Mic, AlertCircle, StopCircle } from 'lucide-react';
-import { generateSpeech } from '../services/geminiService';
+import { Message, Scenario, User, Language, Correction } from '../types';
+import { Send, User as UserIcon, Bot, ArrowLeft, Mic, AlertCircle, StopCircle, Sparkles, Volume2, Loader2, Ear } from 'lucide-react';
+import { generateSpeech, validateGrammar, evaluatePronunciation } from '../services/geminiService';
 
 interface ChatInterfaceProps {
   user: User;
@@ -66,6 +66,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, language, sc
   const [isRecording, setIsRecording] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const sessionRef = useRef<any>(null); // LiveSession type is inferred
@@ -75,6 +76,68 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, language, sc
   const streamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const isRecordingRef = useRef(false);
+  
+  // Audio recording buffers
+  const userAudioChunksRef = useRef<Float32Array[]>([]);
+  const lastUserMessageIdRef = useRef<string | null>(null);
+  
+  // Temporary transcription buffers
+  const currentInputTransRef = useRef('');
+  const currentOutputTransRef = useRef('');
+
+  // Grammar check helper
+  const handleGrammarCheck = async (msgId: string, text: string) => {
+    if (!text || text.length < 2) return;
+    
+    // Slight delay to not block UI
+    setTimeout(async () => {
+      const correction = await validateGrammar(language.name, text, scenario.description);
+      if (correction && !correction.isCorrect) {
+        setMessages(prev => prev.map(m => m.id === msgId ? { ...m, correction } : m));
+      }
+    }, 100);
+  };
+
+  // Replay Audio Helper
+  const handlePlayAudio = async (msgId: string, text: string) => {
+    if (playingMessageId) return;
+    setPlayingMessageId(msgId);
+    
+    try {
+      const msg = messages.find(m => m.id === msgId);
+      let audioData = null;
+      let sampleRate = 24000;
+
+      // Prefer user's original recording if available
+      if (msg?.audioData) {
+        audioData = msg.audioData;
+        sampleRate = 16000; // User recordings are at 16kHz
+      } else {
+        // Fallback to TTS (for AI messages or typed user messages)
+        audioData = await generateSpeech(text);
+        sampleRate = 24000; // Gemini TTS is typically 24kHz
+      }
+
+      if (audioData && audioContextRef.current) {
+        const ctx = audioContextRef.current;
+        if (ctx.state === 'suspended') {
+            await ctx.resume().catch(() => {});
+        }
+        
+        const audioBuffer = await decodeAudioData(decode(audioData), ctx, sampleRate);
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(ctx.destination);
+        source.onended = () => setPlayingMessageId(null);
+        source.start(0);
+      } else {
+        setPlayingMessageId(null);
+      }
+    } catch (error) {
+      console.error("Audio replay error:", error);
+      setPlayingMessageId(null);
+    }
+  };
 
   // Initialize Live Session
   useEffect(() => {
@@ -138,6 +201,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, language, sc
               Location: ${scenario.location}.
               
               CRITICAL INSTRUCTION:
+              You are a FEMALE character. You MUST use feminine grammatical forms for yourself (e.g., in Hindi: "karti hun", "deti hun", "meri").
               You MUST speak ONLY in ${language.name}.
               Do NOT speak English under any circumstances, even if the user speaks English.
               Maintain strict immersion in ${language.name}.
@@ -179,6 +243,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, language, sc
               const inputText = message.serverContent?.inputTranscription?.text;
 
               if (outputText || inputText) {
+                if (inputText) currentInputTransRef.current += inputText;
+                if (outputText) currentOutputTransRef.current += outputText;
+
                 setMessages(prev => {
                   const newMessages = [...prev];
                   const lastMsg = newMessages[newMessages.length - 1];
@@ -211,8 +278,10 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, language, sc
                         ];
                      } else {
                         // Start new user message from speech
+                        const newId = Date.now().toString();
+                        lastUserMessageIdRef.current = newId; // Track this ID to attach audio later
                         return [...prev, {
-                          id: Date.now().toString(),
+                          id: newId,
                           role: 'user',
                           text: inputText,
                           timestamp: Date.now(),
@@ -229,6 +298,22 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, language, sc
                 setMessages(prev => prev.map(m => 
                   m.isStreaming ? { ...m, isStreaming: false } : m
                 ));
+                
+                // Trigger grammar check for user input
+                if (currentInputTransRef.current.trim()) {
+                   // Find the latest user message id to attach correction
+                   const userText = currentInputTransRef.current.trim();
+                   setMessages(currentMsgs => {
+                      const lastUserMsg = [...currentMsgs].reverse().find(m => m.role === 'user' && m.text.includes(userText.substring(0, 10)));
+                      if (lastUserMsg) {
+                          handleGrammarCheck(lastUserMsg.id, userText);
+                      }
+                      return currentMsgs;
+                   });
+                }
+                
+                currentInputTransRef.current = '';
+                currentOutputTransRef.current = '';
               }
             },
             onerror: (e) => {
@@ -280,8 +365,14 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, language, sc
       const source = inputContextRef.current.createMediaStreamSource(stream);
       const processor = inputContextRef.current.createScriptProcessor(4096, 1, 1);
       
+      // Reset chunk buffer
+      userAudioChunksRef.current = [];
+      
       processor.onaudioprocess = (e) => {
         const inputData = e.inputBuffer.getChannelData(0);
+        // Copy buffer because inputBuffer is reused
+        userAudioChunksRef.current.push(new Float32Array(inputData));
+        
         const blob = createBlob(inputData);
         
         if (sessionRef.current) {
@@ -297,6 +388,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, language, sc
       
       setIsRecording(true);
       isRecordingRef.current = true;
+      currentInputTransRef.current = ''; // Reset buffer on new recording
     } catch (err) {
       console.error("Mic error:", err);
       setConnectionError("Microphone access failed");
@@ -316,6 +408,37 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, language, sc
       inputContextRef.current.close();
       inputContextRef.current = null;
     }
+    
+    // Process recorded audio and attach to the message
+    if (userAudioChunksRef.current.length > 0 && lastUserMessageIdRef.current) {
+        // Flatten chunks
+        const totalLen = userAudioChunksRef.current.reduce((acc, c) => acc + c.length, 0);
+        const merged = new Float32Array(totalLen);
+        let offset = 0;
+        userAudioChunksRef.current.forEach(c => {
+            merged.set(c, offset);
+            offset += c.length;
+        });
+        
+        // Encode to base64 pcm (int16)
+        const base64Audio = createBlob(merged).data;
+        
+        // Update the message state with the audio data
+        const targetId = lastUserMessageIdRef.current;
+        setMessages(prev => prev.map(m => 
+            m.id === targetId ? { ...m, audioData: base64Audio } : m
+        ));
+
+        // Trigger Pronunciation Analysis in Background
+        evaluatePronunciation(language.name, base64Audio).then(feedback => {
+            if (feedback) {
+                setMessages(prev => prev.map(m => 
+                    m.id === targetId ? { ...m, pronunciation: feedback } : m
+                ));
+            }
+        });
+    }
+
     setIsRecording(false);
     isRecordingRef.current = false;
   };
@@ -335,14 +458,19 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, language, sc
     const text = inputText.trim();
     setInputText('');
     
+    const newMsgId = Date.now().toString();
+
     // Add optimistic message (Not streaming, finalized immediately)
     setMessages(prev => [...prev, {
-        id: Date.now().toString(),
+        id: newMsgId,
         role: 'user',
         text: text,
         timestamp: Date.now(),
         isStreaming: false
     }]);
+
+    // Trigger grammar check immediately for typed text
+    handleGrammarCheck(newMsgId, text);
 
     // Resume audio context
     if (audioContextRef.current?.state === 'suspended') {
@@ -391,7 +519,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, language, sc
           {messages.map((msg) => {
             const isUser = msg.role === 'user';
             return (
-              <div key={msg.id} className={`flex w-full ${isUser ? 'justify-end' : 'justify-start'}`}>
+              <div key={msg.id} className={`flex flex-col w-full ${isUser ? 'items-end' : 'items-start'}`}>
                 <div className={`flex max-w-[85%] md:max-w-[70%] ${isUser ? 'flex-row-reverse' : 'flex-row'} items-end gap-2`}>
                   
                   <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 ${isUser ? 'bg-indigo-500' : 'bg-emerald-500'}`}>
@@ -399,7 +527,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, language, sc
                   </div>
 
                   <div className={`
-                    p-3.5 rounded-2xl text-sm md:text-base leading-relaxed shadow-sm transition-all duration-200
+                    p-3.5 rounded-2xl text-sm md:text-base leading-relaxed shadow-sm transition-all duration-200 relative
                     ${isUser 
                         ? 'bg-indigo-600 text-white rounded-tr-none' 
                         : 'bg-white text-slate-800 border border-slate-100 rounded-tl-none'
@@ -409,7 +537,63 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, language, sc
                     {msg.text}
                     {msg.isStreaming && <span className="inline-block w-1.5 h-4 ml-1 align-middle bg-current opacity-50 animate-blink">|</span>}
                   </div>
+
+                  {/* Play Audio Button */}
+                  {!msg.isStreaming && (
+                    <button
+                        onClick={() => handlePlayAudio(msg.id, msg.text)}
+                        disabled={!!playingMessageId}
+                        className={`p-2 rounded-full transition-colors flex-shrink-0 ${
+                            isUser 
+                            ? 'text-slate-400 hover:text-indigo-600 hover:bg-indigo-50' 
+                            : 'text-slate-400 hover:text-indigo-600 hover:bg-slate-100'
+                        }`}
+                        title="Listen again"
+                    >
+                         {playingMessageId === msg.id ? (
+                             <Loader2 className="w-4 h-4 animate-spin text-indigo-500" />
+                         ) : (
+                             <Volume2 className="w-4 h-4" />
+                         )}
+                    </button>
+                  )}
                 </div>
+
+                {/* Pronunciation Feedback */}
+                {msg.pronunciation && (
+                    <div className={`mt-2 max-w-[80%] md:max-w-[65%] ${isUser ? 'mr-10' : 'ml-10'}`}>
+                        <div className={`border rounded-xl p-3 text-xs shadow-sm animate-in fade-in slide-in-from-top-2 ${
+                            msg.pronunciation.score > 85 ? 'bg-emerald-50 border-emerald-100 text-emerald-900' : 'bg-amber-50 border-amber-100 text-amber-900'
+                        }`}>
+                            <div className="flex items-center gap-2 mb-1">
+                                <Ear className={`w-4 h-4 ${msg.pronunciation.score > 85 ? 'text-emerald-500' : 'text-amber-500'}`} />
+                                <span className="font-bold">Pronunciation Score: {msg.pronunciation.score}%</span>
+                            </div>
+                            <p className="mb-1">{msg.pronunciation.feedback}</p>
+                            {msg.pronunciation.issues.length > 0 && (
+                                <div className="mt-1 pt-1 border-t border-black/5">
+                                    <span className="font-semibold">Watch out for:</span> {msg.pronunciation.issues.join(", ")}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                )}
+
+                {/* Correction Box */}
+                {msg.correction && (
+                  <div className={`mt-2 max-w-[80%] md:max-w-[65%] ${isUser ? 'mr-10' : 'ml-10'}`}>
+                     <div className="bg-indigo-50/80 backdrop-blur-sm border border-indigo-100 rounded-xl p-3 text-xs text-indigo-900 shadow-sm animate-in fade-in slide-in-from-top-2">
+                        <div className="flex items-start gap-2">
+                           <Sparkles className="w-4 h-4 text-indigo-500 shrink-0 mt-0.5" />
+                           <div className="flex flex-col gap-1">
+                              <span className="font-semibold text-indigo-700">Suggestion:</span>
+                              <span className="text-slate-700">{msg.correction.corrected}</span>
+                              <span className="text-slate-500 italic border-t border-indigo-200/50 pt-1 mt-1">{msg.correction.explanation}</span>
+                           </div>
+                        </div>
+                     </div>
+                  </div>
+                )}
               </div>
             );
           })}

@@ -26,7 +26,7 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
           </div>
         </div>
         
-        <h1 className="text-3xl font-bold text-center text-slate-800 mb-2">Welcome to LingoLoop</h1>
+        <h1 className="text-3xl font-bold text-center text-slate-800 mb-2">Welcome to Let's vibe</h1>
         <p className="text-center text-slate-500 mb-8">Your AI-powered immersive language journey.</p>
         
         <form onSubmit={handleSubmit} className="space-y-4">
