@@ -1,0 +1,7 @@
+{
+  "name": "Let's vibe ",
+  "description": "An immersive AI-powered language learning application that generates unique roleplay scenarios for conversational practice.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
